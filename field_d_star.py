@@ -10,7 +10,9 @@ from dataclasses import dataclass
 # constants
 TOLERANCE = 0.01
 EPS = 1e-9
-
+PENALTY = 20
+OBSTACLE_VAL = 254
+UNDEFINED_VAL = -1
 
 @dataclass(frozen=True)
 class InterpChoice:
@@ -43,12 +45,12 @@ class BoundaryCandidate:
     edge: tuple[tuple[int, int], tuple[int, int]]
 
 class Cell:
-    """Grid cell with a uniform traversal cost or an obstacle flag."""
+    """Grid cell with an integer cost value in [0, 254]."""
     def __init__(self, x, y):
         self.x = x
         self.y = y
-        self.is_obstacle = False
         self.rect_id = None
+        self.cost_value = 0
 
 
 class Node:
@@ -110,7 +112,11 @@ class FieldDStar:
     def get_cell_cost(self, x, y):
         """Returns the traversal cost per unit length for a cell."""
         if 0 <= x < self.cols and 0 <= y < self.rows:
-            return math.inf if self.cells[x][y].is_obstacle else 1.0
+            val = int(self.cells[x][y].cost_value)
+            if val >= OBSTACLE_VAL or val == UNDEFINED_VAL:
+                return math.inf
+
+            return 1.0 + val / PENALTY
         return math.inf
 
     def is_finite(self, value):
@@ -623,11 +629,39 @@ class FieldDStarApp:
         self.dstar.Initialize()
         self.update_visualization()
 
-        master.bind('<space>', lambda event: self.handle_space_press())
-        self.canvas.bind('<Button-1>', self.toggle_obstacle)
-        self.canvas.bind('<Button-3>', self.toggle_obstacle)
+        self.controls = tk.Frame(master)
+        self.controls.pack(fill='x', padx=8, pady=6)
 
-        tk.Label(master, text="Space: Plan / Agent's move | Click: Add / Remove obstacle").pack()
+        self.brush_mode = tk.StringVar(value='cost')
+        tk.Radiobutton(self.controls, text='Paint cost', variable=self.brush_mode, value='cost').pack(side='left')
+        tk.Radiobutton(self.controls, text='Obstacle (254)', variable=self.brush_mode, value='obstacle').pack(side='left')
+        tk.Radiobutton(self.controls, text='Erase (0)', variable=self.brush_mode, value='erase').pack(side='left')
+
+        self.cost_scale = tk.Scale(
+            self.controls,
+            from_=0,
+            to=253,
+            orient='horizontal',
+            length=260,
+            label='Cell cost (0-253)',
+        )
+        self.cost_scale.set(80)
+        self.cost_scale.pack(side='left', padx=10)
+
+        self.cost_label = tk.Label(self.controls, text='Brush value: 80')
+        self.cost_label.pack(side='left', padx=6)
+        self.cost_scale.configure(command=self.update_brush_label)
+
+        master.bind('<space>', lambda event: self.handle_space_press())
+        self.canvas.bind('<Button-1>', self.paint_cell)
+        self.canvas.bind('<B1-Motion>', self.paint_cell)
+        self.canvas.bind('<Button-3>', self.erase_cell)
+        self.canvas.bind('<B3-Motion>', self.erase_cell)
+
+        tk.Label(
+            master,
+            text='Space: plan / move agent | Left click-drag: paint | Right click-drag: erase to 0',
+        ).pack()
 
     def draw_grid(self):
         for x in range(self.COLS):
@@ -642,24 +676,59 @@ class FieldDStarApp:
         self.canvas.create_oval(gx - 8, gy - 8, gx + 8, gy + 8, fill='purple')
         self.canvas.create_text(gx, gy - 15, text="GOAL", fill='purple', font=("Arial", 10, "bold"))
 
-    def toggle_obstacle(self, event):
+    def update_brush_label(self, _value=None):
+        self.cost_label.config(text=f'Brush value: {int(self.cost_scale.get())}')
+
+    def cell_display_color(self, cost_value):
+        if cost_value >= OBSTACLE_VAL:
+            return '#654321'
+        # white -> orange/red as cost rises
+        ratio = max(0.0, min(1.0, cost_value / 253.0))
+        red = 255
+        green = int(255 - 135 * ratio)
+        blue = int(255 - 255 * ratio)
+        return f'#{red:02x}{green:02x}{blue:02x}'
+
+    def apply_cell_value(self, cx, cy, value):
+        if not (0 <= cx < self.COLS and 0 <= cy < self.ROWS):
+            return
+
+        value = int(max(0, min(OBSTACLE_VAL, value)))
+
+        # Prevent placing an obstacle on the agent footprint cell.
+        ax, ay = self.dstar.start_pos
+        if cx <= ax <= cx + 1 and cy <= ay <= cy + 1 and value >= OBSTACLE_VAL:
+            return
+
+        cell = self.cells[cx][cy]
+        if int(cell.cost_value) == value:
+            return
+
+        cell.cost_value = value
+
+        # If cost of cell has changed, replan its 4 corners.
+        for nx in (cx, cx + 1):
+            for ny in (cy, cy + 1):
+                self.dstar.update_node(self.nodes[nx][ny])
+
+        self.dstar.is_optimal = False
+        self.update_visualization()
+
+    def brush_value(self):
+        mode = self.brush_mode.get()
+        if mode == 'obstacle':
+            return OBSTACLE_VAL
+        if mode == 'erase':
+            return 0
+        return int(self.cost_scale.get())
+
+    def paint_cell(self, event):
         cx, cy = event.x // self.CELL_SIZE, event.y // self.CELL_SIZE
-        if 0 <= cx < self.COLS and 0 <= cy < self.ROWS:
-            self.cells[cx][cy].is_obstacle = not self.cells[cx][cy].is_obstacle
+        self.apply_cell_value(cx, cy, self.brush_value())
 
-            # Prevention of putting obstacle in the agent cell
-            ax, ay = self.dstar.start_pos
-            if cx <= ax <= cx + 1 and cy <= ay <= cy + 1 and self.cells[cx][cy].is_obstacle:
-                self.cells[cx][cy].is_obstacle = False
-                return
-
-            # If cost of cell has changed, replan its 4 corners
-            for nx in (cx, cx + 1):
-                for ny in (cy, cy + 1):
-                    self.dstar.update_node(self.nodes[nx][ny])
-
-            self.dstar.is_optimal = False
-            self.update_visualization()
+    def erase_cell(self, event):
+        cx, cy = event.x // self.CELL_SIZE, event.y // self.CELL_SIZE
+        self.apply_cell_value(cx, cy, 0)
 
     def move_agent(self):
         if math.hypot(self.dstar.start_pos[0] - self.dstar.goal_node.x,
@@ -697,10 +766,7 @@ class FieldDStarApp:
         for x in range(self.COLS):
             for y in range(self.ROWS):
                 c = self.cells[x][y]
-                if c.is_obstacle:
-                    self.canvas.itemconfig(c.rect_id, fill='#654321')  # Obstacle
-                else:
-                    self.canvas.itemconfig(c.rect_id, fill='white')
+                self.canvas.itemconfig(c.rect_id, fill=self.cell_display_color(int(c.cost_value)))
 
         if self.path_line_id:
             self.canvas.delete(self.path_line_id)
